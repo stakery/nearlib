@@ -1,6 +1,6 @@
 'use strict';
 
-import { Provider, FinalTransactionResult, NodeStatusResult, BlockResult } from './provider';
+import { Provider, FinalExecutionOutcome, NodeStatusResult, BlockResult, adaptTransactionResult } from './provider';
 import { Network } from '../utils/network';
 import { ConnectionInfo, fetchJson } from '../utils/web';
 import { base_encode } from '../utils/serialize';
@@ -30,18 +30,18 @@ export class JsonRpcProvider extends Provider {
         return this.sendJsonRpc('status', []);
     }
 
-    async sendTransaction(signedTransaction: SignedTransaction): Promise<FinalTransactionResult> {
+    async sendTransaction(signedTransaction: SignedTransaction): Promise<FinalExecutionOutcome> {
         const bytes = signedTransaction.encode();
-        return this.sendJsonRpc('broadcast_tx_commit', [Buffer.from(bytes).toString('base64')]);
+        return this.sendJsonRpc('broadcast_tx_commit', [Buffer.from(bytes).toString('base64')]).then(adaptTransactionResult);
     }
 
-    async txStatus(txHash: Uint8Array): Promise<FinalTransactionResult> {
-        return this.sendJsonRpc('tx', [base_encode(txHash)]);
+    async txStatus(txHash: Uint8Array): Promise<FinalExecutionOutcome> {
+        return this.sendJsonRpc('tx', [base_encode(txHash)]).then(adaptTransactionResult);
     }
 
     async query(path: string, data: string): Promise<any> {
         const result = await this.sendJsonRpc('query', [path, data]);
-        if (result.error) {
+        if (result && result.error) {
             throw new Error(`Quering ${path} failed: ${result.error}.\n${JSON.stringify(result, null, 2)}`);
         }
         return result;

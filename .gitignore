@@ -10,3 +10,4 @@ package-lock.json
 neardev/
 coverage/
 src\.ts/protos\.d\.ts
+package\-lock\.json

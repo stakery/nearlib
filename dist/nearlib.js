@@ -5,7 +5,7 @@ window.nearlib = require('./lib/index');
 window.Buffer = Buffer;
 
 }).call(this,require("buffer").Buffer)
-},{"./lib/index":6,"buffer":31,"error-polyfill":38}],2:[function(require,module,exports){
+},{"./lib/index":6,"buffer":32,"error-polyfill":39}],2:[function(require,module,exports){
 (function (Buffer){
 'use strict';
 Object.defineProperty(exports, "__esModule", { value: true });
@@ -16,7 +16,7 @@ const key_pair_1 = require("./utils/key_pair");
 // Default amount of tokens to be send with the function calls. Used to pay for the fees
 // incurred while running the contract execution. The unused amount will be refunded back to
 // the originator.
-const DEFAULT_FUNC_CALL_AMOUNT = 1000000;
+const DEFAULT_FUNC_CALL_AMOUNT = 2000000;
 // Default number of retries before giving up on a transactioin.
 const TX_STATUS_RETRY_NUMBER = 10;
 // Default wait until next retry in millis.
@@ -36,16 +36,16 @@ class Account {
         return this._ready || (this._ready = Promise.resolve(this.fetchState()));
     }
     async fetchState() {
+        this._accessKey = null;
         this._state = await this.connection.provider.query(`account/${this.accountId}`, '');
-        try {
-            const publicKey = (await this.connection.signer.getPublicKey(this.accountId, this.connection.networkId)).toString();
-            this._accessKey = await this.connection.provider.query(`access_key/${this.accountId}/${publicKey}`, '');
-            if (this._accessKey === null) {
-                throw new Error(`Failed to fetch access key for '${this.accountId}' with public key ${publicKey}`);
-            }
+        const publicKey = await this.connection.signer.getPublicKey(this.accountId, this.connection.networkId);
+        if (!publicKey) {
+            console.log(`Missing public key for ${this.accountId} in ${this.connection.networkId}`);
+            return;
         }
-        catch {
-            this._accessKey = null;
+        this._accessKey = await this.connection.provider.query(`access_key/${this.accountId}/${publicKey.toString()}`, '');
+        if (!this._accessKey) {
+            throw new Error(`Failed to fetch access key for '${this.accountId}' with public key ${publicKey.toString()}`);
         }
     }
     async state() {
@@ -62,7 +62,8 @@ class Account {
         let waitTime = TX_STATUS_RETRY_WAIT;
         for (let i = 0; i < TX_STATUS_RETRY_NUMBER; i++) {
             result = await this.connection.provider.txStatus(txHash);
-            if (result.status === 'Failed' || result.status === 'Completed') {
+            if (result.status === provider_1.FinalExecutionStatusBasic.Failure ||
+                typeof result.status === 'object' && typeof result.status.SuccessValue === 'string') {
                 return result;
             }
             await sleep(waitTime);
@@ -73,7 +74,7 @@ class Account {
     }
     async signAndSendTransaction(receiverId, actions) {
         await this.ready;
-        if (this._accessKey === null) {
+        if (!this._accessKey) {
             throw new Error(`Can not sign transactions, initialize account with available public key in Signer.`);
         }
         const status = await this.connection.provider.status();
@@ -90,12 +91,12 @@ class Account {
                 throw error;
             }
         }
-        const flatLogs = result.transactions.reduce((acc, it) => acc.concat(it.result.logs), []);
+        const flatLogs = [result.transaction, ...result.receipts].reduce((acc, it) => acc.concat(it.outcome.logs), []);
         this.printLogs(signedTx.transaction.receiverId, flatLogs);
-        if (result.status === provider_1.FinalTransactionStatus.Failed) {
+        if (result.status === provider_1.FinalExecutionStatusBasic.Failure) {
             if (flatLogs) {
                 const errorMessage = flatLogs.find(it => it.startsWith('ABORT:')) || flatLogs.find(it => it.startsWith('Runtime error:')) || '';
-                throw new Error(`Transaction ${result.transactions[0].hash} failed. ${errorMessage}`);
+                throw new Error(`Transaction ${result.transaction.id} failed. ${errorMessage}`);
             }
         }
         // TODO: if Tx is Unknown or Started.
@@ -115,6 +116,9 @@ class Account {
         const accessKey = transaction_1.fullAccessKey();
         return this.signAndSendTransaction(newAccountId, [transaction_1.createAccount(), transaction_1.transfer(amount), transaction_1.addKey(key_pair_1.PublicKey.from(publicKey), accessKey)]);
     }
+    async deleteAccount(beneficiaryId) {
+        return this.signAndSendTransaction(this.accountId, [transaction_1.deleteAccount(beneficiaryId)]);
+    }
     async deployContract(data) {
         return this.signAndSendTransaction(this.accountId, [transaction_1.deployContract(data)]);
     }
@@ -127,7 +131,7 @@ class Account {
     // TODO: expand this API to support more options.
     async addKey(publicKey, contractId, methodName, amount) {
         let accessKey;
-        if (contractId === null || contractId === undefined) {
+        if (contractId === null || contractId === undefined || contractId === '') {
             accessKey = transaction_1.fullAccessKey();
         }
         else {
@@ -146,7 +150,7 @@ class Account {
         if (result.logs) {
             this.printLogs(contractId, result.logs);
         }
-        return JSON.parse(Buffer.from(result.result).toString());
+        return result.result && result.result.length > 0 && JSON.parse(Buffer.from(result.result).toString());
     }
     /// Returns array of {access_key: AccessKey, public_key: PublicKey} items.
     async getAccessKeys() {
@@ -174,7 +178,7 @@ class Account {
 exports.Account = Account;
 
 }).call(this,require("buffer").Buffer)
-},{"./providers/provider":16,"./transaction":18,"./utils/key_pair":20,"./utils/serialize":22,"buffer":31}],3:[function(require,module,exports){
+},{"./providers/provider":16,"./transaction":18,"./utils/key_pair":21,"./utils/serialize":23,"buffer":32}],3:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 /**
@@ -251,6 +255,7 @@ class Contract {
         options.viewMethods.forEach((methodName) => {
             Object.defineProperty(this, methodName, {
                 writable: false,
+                enumerable: true,
                 value: async function (args) {
                     return this.account.viewFunction(this.contractId, methodName, args || {});
                 }
@@ -259,8 +264,9 @@ class Contract {
         options.changeMethods.forEach((methodName) => {
             Object.defineProperty(this, methodName, {
                 writable: false,
-                value: async function (args) {
-                    const rawResult = await this.account.functionCall(this.contractId, methodName, args || {});
+                enumerable: true,
+                value: async function (args, gas, amount) {
+                    const rawResult = await this.account.functionCall(this.contractId, methodName, args || {}, gas, amount);
                     return providers_1.getTransactionLastResult(rawResult);
                 }
             });
@@ -305,7 +311,7 @@ exports.connect = near_1.connect;
 const wallet_account_1 = require("./wallet-account");
 exports.WalletAccount = wallet_account_1.WalletAccount;
 
-},{"./account":2,"./account_creator":3,"./connection":4,"./contract":5,"./key_stores":9,"./near":13,"./providers":14,"./signer":17,"./transaction":18,"./utils":19,"./utils/key_pair":20,"./wallet-account":24}],7:[function(require,module,exports){
+},{"./account":2,"./account_creator":3,"./connection":4,"./contract":5,"./key_stores":9,"./near":13,"./providers":14,"./signer":17,"./transaction":18,"./utils":20,"./utils/key_pair":21,"./wallet-account":25}],7:[function(require,module,exports){
 'use strict';
 Object.defineProperty(exports, "__esModule", { value: true });
 const keystore_1 = require("./keystore");
@@ -370,7 +376,7 @@ class BrowserLocalStorageKeyStore extends keystore_1.KeyStore {
 }
 exports.BrowserLocalStorageKeyStore = BrowserLocalStorageKeyStore;
 
-},{"../utils/key_pair":20,"./keystore":10}],8:[function(require,module,exports){
+},{"../utils/key_pair":21,"./keystore":10}],8:[function(require,module,exports){
 'use strict';
 Object.defineProperty(exports, "__esModule", { value: true });
 const keystore_1 = require("./keystore");
@@ -420,7 +426,7 @@ class InMemoryKeyStore extends keystore_1.KeyStore {
 }
 exports.InMemoryKeyStore = InMemoryKeyStore;
 
-},{"../utils/key_pair":20,"./keystore":10}],9:[function(require,module,exports){
+},{"../utils/key_pair":21,"./keystore":10}],9:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 const keystore_1 = require("./keystore");
@@ -541,6 +547,16 @@ async function ensureDir(path) {
         }
     }
 }
+async function readKeyFile(path) {
+    const accountInfo = await loadJsonFile(path);
+    // The private key might be in private_key or secret_key field.
+    let privateKey = accountInfo.private_key;
+    if (!privateKey && accountInfo.secret_key) {
+        privateKey = accountInfo.secret_key;
+    }
+    return [accountInfo.account_id, key_pair_1.KeyPair.fromString(privateKey)];
+}
+exports.readKeyFile = readKeyFile;
 class UnencryptedFileSystemKeyStore extends keystore_1.KeyStore {
     constructor(keyDir) {
         super();
@@ -556,8 +572,8 @@ class UnencryptedFileSystemKeyStore extends keystore_1.KeyStore {
         if (!await exists(this.getKeyFilePath(networkId, accountId))) {
             return null;
         }
-        const accountInfo = await loadJsonFile(this.getKeyFilePath(networkId, accountId));
-        return key_pair_1.KeyPair.fromString(accountInfo.private_key);
+        const accountKeyPair = await readKeyFile(this.getKeyFilePath(networkId, accountId));
+        return accountKeyPair[1];
     }
     async removeKey(networkId, accountId) {
         if (await exists(this.getKeyFilePath(networkId, accountId))) {
@@ -594,7 +610,7 @@ class UnencryptedFileSystemKeyStore extends keystore_1.KeyStore {
 }
 exports.UnencryptedFileSystemKeyStore = UnencryptedFileSystemKeyStore;
 
-},{"../utils/key_pair":20,"./keystore":10,"fs":29,"util":67}],13:[function(require,module,exports){
+},{"../utils/key_pair":21,"./keystore":10,"fs":30,"util":69}],13:[function(require,module,exports){
 "use strict";
 var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
@@ -605,7 +621,6 @@ const account_1 = require("./account");
 const connection_1 = require("./connection");
 const contract_1 = require("./contract");
 const unencrypted_file_system_keystore_1 = require("./key_stores/unencrypted_file_system_keystore");
-const key_pair_1 = require("./utils/key_pair");
 const account_creator_1 = require("./account_creator");
 const key_stores_1 = require("./key_stores");
 class Near {
@@ -659,7 +674,7 @@ class Near {
         console.warn('near.sendTokens is deprecated. Use `yourAccount.sendMoney` instead.');
         const account = new account_1.Account(this.connection, originator);
         const result = await account.sendMoney(receiver, amount);
-        return result.transactions[0].hash;
+        return result.transaction.id;
     }
 }
 exports.Near = Near;
@@ -667,17 +682,17 @@ async function connect(config) {
     // Try to find extra key in `KeyPath` if provided.
     if (config.keyPath && config.deps && config.deps.keyStore) {
         try {
-            const keyFile = await unencrypted_file_system_keystore_1.loadJsonFile(config.keyPath);
-            if (keyFile.account_id) {
+            const accountKeyFile = await unencrypted_file_system_keystore_1.readKeyFile(config.keyPath);
+            if (accountKeyFile[0]) {
                 // TODO: Only load key if network ID matches
-                const keyPair = key_pair_1.KeyPair.fromString(keyFile.secret_key);
+                const keyPair = accountKeyFile[1];
                 const keyPathStore = new key_stores_1.InMemoryKeyStore();
-                await keyPathStore.setKey(config.networkId, keyFile.account_id, keyPair);
+                await keyPathStore.setKey(config.networkId, accountKeyFile[0], keyPair);
                 if (!config.masterAccount) {
-                    config.masterAccount = keyFile.account_id;
+                    config.masterAccount = accountKeyFile[0];
                 }
                 config.deps.keyStore = new key_stores_1.MergeKeyStore([config.deps.keyStore, keyPathStore]);
-                console.log(`Loaded master account ${keyFile.account_id} key from ${config.keyPath} with public key = ${keyPair.getPublicKey()}`);
+                console.log(`Loaded master account ${accountKeyFile[0]} key from ${config.keyPath} with public key = ${keyPair.getPublicKey()}`);
             }
         }
         catch (error) {
@@ -688,12 +703,14 @@ async function connect(config) {
 }
 exports.connect = connect;
 
-},{"./account":2,"./account_creator":3,"./connection":4,"./contract":5,"./key_stores":9,"./key_stores/unencrypted_file_system_keystore":12,"./utils/key_pair":20,"bn.js":27}],14:[function(require,module,exports){
+},{"./account":2,"./account_creator":3,"./connection":4,"./contract":5,"./key_stores":9,"./key_stores/unencrypted_file_system_keystore":12,"bn.js":28}],14:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 const provider_1 = require("./provider");
 exports.Provider = provider_1.Provider;
 exports.getTransactionLastResult = provider_1.getTransactionLastResult;
+exports.FinalExecutionStatusBasic = provider_1.FinalExecutionStatusBasic;
+exports.adaptTransactionResult = provider_1.adaptTransactionResult;
 const json_rpc_provider_1 = require("./json-rpc-provider");
 exports.JsonRpcProvider = json_rpc_provider_1.JsonRpcProvider;
 
@@ -723,14 +740,14 @@ class JsonRpcProvider extends provider_1.Provider {
     }
     async sendTransaction(signedTransaction) {
         const bytes = signedTransaction.encode();
-        return this.sendJsonRpc('broadcast_tx_commit', [Buffer.from(bytes).toString('base64')]);
+        return this.sendJsonRpc('broadcast_tx_commit', [Buffer.from(bytes).toString('base64')]).then(provider_1.adaptTransactionResult);
     }
     async txStatus(txHash) {
-        return this.sendJsonRpc('tx', [serialize_1.base_encode(txHash)]);
+        return this.sendJsonRpc('tx', [serialize_1.base_encode(txHash)]).then(provider_1.adaptTransactionResult);
     }
     async query(path, data) {
         const result = await this.sendJsonRpc('query', [path, data]);
-        if (result.error) {
+        if (result && result.error) {
             throw new Error(`Quering ${path} failed: ${result.error}.\n${JSON.stringify(result, null, 2)}`);
         }
         return result;
@@ -755,25 +772,113 @@ class JsonRpcProvider extends provider_1.Provider {
 exports.JsonRpcProvider = JsonRpcProvider;
 
 }).call(this,require("buffer").Buffer)
-},{"../utils/serialize":22,"../utils/web":23,"./provider":16,"buffer":31}],16:[function(require,module,exports){
+},{"../utils/serialize":23,"../utils/web":24,"./provider":16,"buffer":32}],16:[function(require,module,exports){
 (function (Buffer){
 'use strict';
 Object.defineProperty(exports, "__esModule", { value: true });
-var FinalTransactionStatus;
-(function (FinalTransactionStatus) {
-    FinalTransactionStatus["Unknown"] = "Unknown";
-    FinalTransactionStatus["Started"] = "Started";
-    FinalTransactionStatus["Failed"] = "Failed";
-    FinalTransactionStatus["Completed"] = "Completed";
-})(FinalTransactionStatus = exports.FinalTransactionStatus || (exports.FinalTransactionStatus = {}));
+const enums_1 = require("../utils/enums");
+var ExecutionStatusBasic;
+(function (ExecutionStatusBasic) {
+    ExecutionStatusBasic["Unknown"] = "Unknown";
+    ExecutionStatusBasic["Pending"] = "Pending";
+    ExecutionStatusBasic["Failure"] = "Failure";
+})(ExecutionStatusBasic = exports.ExecutionStatusBasic || (exports.ExecutionStatusBasic = {}));
+class ExecutionStatus extends enums_1.Enum {
+}
+exports.ExecutionStatus = ExecutionStatus;
+var FinalExecutionStatusBasic;
+(function (FinalExecutionStatusBasic) {
+    FinalExecutionStatusBasic["NotStarted"] = "NotStarted";
+    FinalExecutionStatusBasic["Started"] = "Started";
+    FinalExecutionStatusBasic["Failure"] = "Failure";
+})(FinalExecutionStatusBasic = exports.FinalExecutionStatusBasic || (exports.FinalExecutionStatusBasic = {}));
+class FinalExecutionStatus extends enums_1.Enum {
+}
+exports.FinalExecutionStatus = FinalExecutionStatus;
+var LegacyFinalTransactionStatus;
+(function (LegacyFinalTransactionStatus) {
+    LegacyFinalTransactionStatus["Unknown"] = "Unknown";
+    LegacyFinalTransactionStatus["Started"] = "Started";
+    LegacyFinalTransactionStatus["Failed"] = "Failed";
+    LegacyFinalTransactionStatus["Completed"] = "Completed";
+})(LegacyFinalTransactionStatus || (LegacyFinalTransactionStatus = {}));
+var LegacyTransactionStatus;
+(function (LegacyTransactionStatus) {
+    LegacyTransactionStatus["Unknown"] = "Unknown";
+    LegacyTransactionStatus["Completed"] = "Completed";
+    LegacyTransactionStatus["Failed"] = "Failed";
+})(LegacyTransactionStatus || (LegacyTransactionStatus = {}));
+function mapLegacyTransactionLog(tl) {
+    let status;
+    if (tl.result.status === LegacyTransactionStatus.Unknown) {
+        status = ExecutionStatusBasic.Unknown;
+    }
+    else if (tl.result.status === LegacyTransactionStatus.Failed) {
+        status = ExecutionStatusBasic.Failure;
+    }
+    else if (tl.result.status === LegacyTransactionStatus.Completed) {
+        status = {
+            SuccessValue: tl.result.result || ''
+        };
+    }
+    return {
+        id: tl.hash,
+        outcome: {
+            status,
+            logs: tl.result.logs,
+            receipt_ids: tl.result.receipts,
+            gas_burnt: 0,
+        },
+    };
+}
+function adaptTransactionResult(txResult) {
+    if ('transactions' in txResult) {
+        txResult = txResult;
+        let status;
+        if (txResult.status === LegacyFinalTransactionStatus.Unknown) {
+            status = FinalExecutionStatusBasic.NotStarted;
+        }
+        else if (txResult.status === LegacyFinalTransactionStatus.Started) {
+            status = FinalExecutionStatusBasic.Started;
+        }
+        else if (txResult.status === LegacyFinalTransactionStatus.Failed) {
+            status = FinalExecutionStatusBasic.Failure;
+        }
+        else if (txResult.status === LegacyFinalTransactionStatus.Completed) {
+            let result = '';
+            for (let i = txResult.transactions.length - 1; i >= 0; --i) {
+                const r = txResult.transactions[i];
+                if (r.result && r.result.result && r.result.result.length > 0) {
+                    result = r.result.result;
+                    break;
+                }
+            }
+            status = {
+                SuccessValue: result,
+            };
+        }
+        return {
+            status: status,
+            transaction: mapLegacyTransactionLog(txResult.transactions.splice(0, 1)[0]),
+            receipts: txResult.transactions.map(mapLegacyTransactionLog),
+        };
+    }
+    else {
+        return txResult;
+    }
+}
+exports.adaptTransactionResult = adaptTransactionResult;
 class Provider {
 }
 exports.Provider = Provider;
 function getTransactionLastResult(txResult) {
-    for (let i = txResult.transactions.length - 1; i >= 0; --i) {
-        const r = txResult.transactions[i];
-        if (r.result && r.result.result && r.result.result.length > 0) {
-            return JSON.parse(Buffer.from(r.result.result, 'base64').toString());
+    if (typeof txResult.status === 'object' && typeof txResult.status.SuccessValue === 'string') {
+        const value = Buffer.from(txResult.status.SuccessValue, 'base64').toString();
+        try {
+            return JSON.parse(value);
+        }
+        catch (e) {
+            return value;
         }
     }
     return null;
@@ -781,7 +886,7 @@ function getTransactionLastResult(txResult) {
 exports.getTransactionLastResult = getTransactionLastResult;
 
 }).call(this,require("buffer").Buffer)
-},{"buffer":31}],17:[function(require,module,exports){
+},{"../utils/enums":19,"buffer":32}],17:[function(require,module,exports){
 'use strict';
 var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
@@ -819,6 +924,9 @@ class InMemorySigner extends Signer {
     }
     async getPublicKey(accountId, networkId) {
         const keyPair = await this.keyStore.getKey(networkId, accountId);
+        if (keyPair === null) {
+            return null;
+        }
         return keyPair.getPublicKey();
     }
     async signHash(hash, accountId, networkId) {
@@ -834,43 +942,26 @@ class InMemorySigner extends Signer {
 }
 exports.InMemorySigner = InMemorySigner;
 
-},{"./utils/key_pair":20,"js-sha256":50}],18:[function(require,module,exports){
+},{"./utils/key_pair":21,"js-sha256":51}],18:[function(require,module,exports){
 'use strict';
 var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 const js_sha256_1 = __importDefault(require("js-sha256"));
+const enums_1 = require("./utils/enums");
 const serialize_1 = require("./utils/serialize");
 const key_pair_1 = require("./utils/key_pair");
-class Enum {
-    constructor(properties) {
-        if (Object.keys(properties).length !== 1) {
-            throw new Error('Enum can only take single value');
-        }
-        Object.keys(properties).map((key) => {
-            this[key] = properties[key];
-            this.enum = key;
-        });
-    }
-}
-class Assignable {
-    constructor(properties) {
-        Object.keys(properties).map((key) => {
-            this[key] = properties[key];
-        });
-    }
-}
-class FunctionCallPermission extends Assignable {
+class FunctionCallPermission extends enums_1.Assignable {
 }
 exports.FunctionCallPermission = FunctionCallPermission;
-class FullAccessPermission extends Assignable {
+class FullAccessPermission extends enums_1.Assignable {
 }
 exports.FullAccessPermission = FullAccessPermission;
-class AccessKeyPermission extends Enum {
+class AccessKeyPermission extends enums_1.Enum {
 }
 exports.AccessKeyPermission = AccessKeyPermission;
-class AccessKey extends Assignable {
+class AccessKey extends enums_1.Assignable {
 }
 exports.AccessKey = AccessKey;
 function fullAccessKey() {
@@ -881,7 +972,7 @@ function functionCallAccessKey(receiverId, methodNames, allowance) {
     return new AccessKey({ nonce: 0, permission: new AccessKeyPermission({ functionCall: new FunctionCallPermission({ receiverId, allowance, methodNames }) }) });
 }
 exports.functionCallAccessKey = functionCallAccessKey;
-class IAction extends Assignable {
+class IAction extends enums_1.Assignable {
 }
 exports.IAction = IAction;
 class CreateAccount extends IAction {
@@ -938,24 +1029,39 @@ class Signature {
         this.data = signature;
     }
 }
-class Transaction extends Assignable {
+class Transaction extends enums_1.Assignable {
 }
-class SignedTransaction extends Assignable {
+exports.Transaction = Transaction;
+class SignedTransaction extends enums_1.Assignable {
     encode() {
-        return serialize_1.serialize(SCHEMA, this);
+        return serialize_1.serialize(exports.SCHEMA, this);
     }
 }
 exports.SignedTransaction = SignedTransaction;
-class Action extends Enum {
+class Action extends enums_1.Enum {
 }
 exports.Action = Action;
-const SCHEMA = new Map([
-    [Signature, { kind: 'struct', fields: [['keyType', 'u8'], ['data', [32]]] }],
-    [SignedTransaction, { kind: 'struct', fields: [['transaction', Transaction], ['signature', Signature]] }],
-    [Transaction, { kind: 'struct', fields: [['signerId', 'string'], ['publicKey', key_pair_1.PublicKey], ['nonce', 'u64'], ['receiverId', 'string'], ['blockHash', [32]], ['actions', [Action]]] }],
-    [key_pair_1.PublicKey, {
-            kind: 'struct', fields: [['keyType', 'u8'], ['data', [32]]]
-        }],
+exports.SCHEMA = new Map([
+    [Signature, { kind: 'struct', fields: [
+                ['keyType', 'u8'],
+                ['data', [32]]
+            ] }],
+    [SignedTransaction, { kind: 'struct', fields: [
+                ['transaction', Transaction],
+                ['signature', Signature]
+            ] }],
+    [Transaction, { kind: 'struct', fields: [
+                ['signerId', 'string'],
+                ['publicKey', key_pair_1.PublicKey],
+                ['nonce', 'u64'],
+                ['receiverId', 'string'],
+                ['blockHash', [32]],
+                ['actions', [Action]]
+            ] }],
+    [key_pair_1.PublicKey, { kind: 'struct', fields: [
+                ['keyType', 'u8'],
+                ['data', [32]]
+            ] }],
     [AccessKey, { kind: 'struct', fields: [
                 ['nonce', 'u64'],
                 ['permission', AccessKeyPermission],
@@ -981,18 +1087,37 @@ const SCHEMA = new Map([
                 ['deleteAccount', deleteAccount],
             ] }],
     [CreateAccount, { kind: 'struct', fields: [] }],
-    [DeployContract, { kind: 'struct', fields: [['code', ['u8']]] }],
-    [FunctionCall, { kind: 'struct', fields: [['methodName', 'string'], ['args', ['u8']], ['gas', 'u64'], ['deposit', 'u128']] }],
-    [Transfer, { kind: 'struct', fields: [['deposit', 'u128']] }],
-    [Stake, { kind: 'struct', fields: [['stake', 'u128'], ['publicKey', key_pair_1.PublicKey]] }],
-    [AddKey, { kind: 'struct', fields: [['publicKey', key_pair_1.PublicKey], ['accessKey', AccessKey]] }],
-    [DeleteKey, { kind: 'struct', fields: [['publicKey', key_pair_1.PublicKey]] }],
-    [DeleteAccount, { kind: 'struct', fields: [['beneficiaryId', 'string']] }],
+    [DeployContract, { kind: 'struct', fields: [
+                ['code', ['u8']]
+            ] }],
+    [FunctionCall, { kind: 'struct', fields: [
+                ['methodName', 'string'],
+                ['args', ['u8']],
+                ['gas', 'u64'],
+                ['deposit', 'u128']
+            ] }],
+    [Transfer, { kind: 'struct', fields: [
+                ['deposit', 'u128']
+            ] }],
+    [Stake, { kind: 'struct', fields: [
+                ['stake', 'u128'],
+                ['publicKey', key_pair_1.PublicKey]
+            ] }],
+    [AddKey, { kind: 'struct', fields: [
+                ['publicKey', key_pair_1.PublicKey],
+                ['accessKey', AccessKey]
+            ] }],
+    [DeleteKey, { kind: 'struct', fields: [
+                ['publicKey', key_pair_1.PublicKey]
+            ] }],
+    [DeleteAccount, { kind: 'struct', fields: [
+                ['beneficiaryId', 'string']
+            ] }],
 ]);
 async function signTransaction(receiverId, nonce, actions, blockHash, signer, accountId, networkId) {
     const publicKey = await signer.getPublicKey(accountId, networkId);
     const transaction = new Transaction({ signerId: accountId, publicKey, nonce, receiverId, actions, blockHash });
-    const message = serialize_1.serialize(SCHEMA, transaction);
+    const message = serialize_1.serialize(exports.SCHEMA, transaction);
     const hash = new Uint8Array(js_sha256_1.default.sha256.array(message));
     const signature = await signer.signHash(hash, accountId, networkId);
     const signedTx = new SignedTransaction({ transaction, signature: new Signature(signature.signature) });
@@ -1000,7 +1125,31 @@ async function signTransaction(receiverId, nonce, actions, blockHash, signer, ac
 }
 exports.signTransaction = signTransaction;
 
-},{"./utils/key_pair":20,"./utils/serialize":22,"js-sha256":50}],19:[function(require,module,exports){
+},{"./utils/enums":19,"./utils/key_pair":21,"./utils/serialize":23,"js-sha256":51}],19:[function(require,module,exports){
+'use strict';
+Object.defineProperty(exports, "__esModule", { value: true });
+class Enum {
+    constructor(properties) {
+        if (Object.keys(properties).length !== 1) {
+            throw new Error('Enum can only take single value');
+        }
+        Object.keys(properties).map((key) => {
+            this[key] = properties[key];
+            this.enum = key;
+        });
+    }
+}
+exports.Enum = Enum;
+class Assignable {
+    constructor(properties) {
+        Object.keys(properties).map((key) => {
+            this[key] = properties[key];
+        });
+    }
+}
+exports.Assignable = Assignable;
+
+},{}],20:[function(require,module,exports){
 "use strict";
 var __importStar = (this && this.__importStar) || function (mod) {
     if (mod && mod.__esModule) return mod;
@@ -1018,11 +1167,14 @@ const serialize = __importStar(require("./serialize"));
 exports.serialize = serialize;
 const web = __importStar(require("./web"));
 exports.web = web;
+const enums = __importStar(require("./enums"));
+exports.enums = enums;
 const key_pair_1 = require("./key_pair");
+exports.PublicKey = key_pair_1.PublicKey;
 exports.KeyPair = key_pair_1.KeyPair;
 exports.KeyPairEd25519 = key_pair_1.KeyPairEd25519;
 
-},{"./key_pair":20,"./network":21,"./serialize":22,"./web":23}],20:[function(require,module,exports){
+},{"./enums":19,"./key_pair":21,"./network":22,"./serialize":23,"./web":24}],21:[function(require,module,exports){
 'use strict';
 var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
@@ -1148,11 +1300,11 @@ class KeyPairEd25519 extends KeyPair {
 }
 exports.KeyPairEd25519 = KeyPairEd25519;
 
-},{"./serialize":22,"tweetnacl":61}],21:[function(require,module,exports){
+},{"./serialize":23,"tweetnacl":62}],22:[function(require,module,exports){
 'use strict';
 Object.defineProperty(exports, "__esModule", { value: true });
 
-},{}],22:[function(require,module,exports){
+},{}],23:[function(require,module,exports){
 (function (Buffer){
 'use strict';
 var __importDefault = (this && this.__importDefault) || function (mod) {
@@ -1169,7 +1321,7 @@ function base_encode(value) {
 }
 exports.base_encode = base_encode;
 function base_decode(value) {
-    return bs58_1.default.decode(value);
+    return Buffer.from(bs58_1.default.decode(value));
 }
 exports.base_decode = base_decode;
 const INITIAL_LENGTH = 1024;
@@ -1369,7 +1521,7 @@ function deserialize(schema, classType, buffer) {
 exports.deserialize = deserialize;
 
 }).call(this,require("buffer").Buffer)
-},{"bn.js":27,"bs58":30,"buffer":31}],23:[function(require,module,exports){
+},{"bn.js":28,"bs58":31,"buffer":32}],24:[function(require,module,exports){
 'use strict';
 var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
@@ -1397,7 +1549,7 @@ async function fetchJson(connection, json) {
 }
 exports.fetchJson = fetchJson;
 
-},{"http-errors":47,"node-fetch":29}],24:[function(require,module,exports){
+},{"http-errors":48,"node-fetch":30}],25:[function(require,module,exports){
 'use strict';
 Object.defineProperty(exports, "__esModule", { value: true });
 const utils_1 = require("./utils");
@@ -1493,159 +1645,129 @@ class WalletAccount {
 }
 exports.WalletAccount = WalletAccount;
 
-},{"./utils":19}],25:[function(require,module,exports){
+},{"./utils":20}],26:[function(require,module,exports){
+'use strict'
 // base-x encoding / decoding
 // Copyright (c) 2018 base-x contributors
 // Copyright (c) 2014-2018 The Bitcoin Core developers (base58.cpp)
 // Distributed under the MIT software license, see the accompanying
 // file LICENSE or http://www.opensource.org/licenses/mit-license.php.
-
-const Buffer = require('safe-buffer').Buffer
-
-module.exports = function base (ALPHABET) {
-  if (ALPHABET.length >= 255) throw new TypeError('Alphabet too long')
-
-  const BASE_MAP = new Uint8Array(256)
+// @ts-ignore
+var _Buffer = require('safe-buffer').Buffer
+function base (ALPHABET) {
+  if (ALPHABET.length >= 255) { throw new TypeError('Alphabet too long') }
+  var BASE_MAP = new Uint8Array(256)
   BASE_MAP.fill(255)
-
-  for (let i = 0; i < ALPHABET.length; i++) {
-    const x = ALPHABET.charAt(i)
-    const xc = x.charCodeAt(0)
-
-    if (BASE_MAP[xc] !== 255) throw new TypeError(x + ' is ambiguous')
+  for (var i = 0; i < ALPHABET.length; i++) {
+    var x = ALPHABET.charAt(i)
+    var xc = x.charCodeAt(0)
+    if (BASE_MAP[xc] !== 255) { throw new TypeError(x + ' is ambiguous') }
     BASE_MAP[xc] = i
   }
-
-  const BASE = ALPHABET.length
-  const LEADER = ALPHABET.charAt(0)
-  const FACTOR = Math.log(BASE) / Math.log(256) // log(BASE) / log(256), rounded up
-  const iFACTOR = Math.log(256) / Math.log(BASE) // log(256) / log(BASE), rounded up
-
+  var BASE = ALPHABET.length
+  var LEADER = ALPHABET.charAt(0)
+  var FACTOR = Math.log(BASE) / Math.log(256) // log(BASE) / log(256), rounded up
+  var iFACTOR = Math.log(256) / Math.log(BASE) // log(256) / log(BASE), rounded up
   function encode (source) {
-    if (!Buffer.isBuffer(source)) throw new TypeError('Expected Buffer')
-    if (source.length === 0) return ''
-
-    // Skip & count leading zeroes.
-    let zeroes = 0
-    let length = 0
-    let pbegin = 0
-    const pend = source.length
-
+    if (!_Buffer.isBuffer(source)) { throw new TypeError('Expected Buffer') }
+    if (source.length === 0) { return '' }
+        // Skip & count leading zeroes.
+    var zeroes = 0
+    var length = 0
+    var pbegin = 0
+    var pend = source.length
     while (pbegin !== pend && source[pbegin] === 0) {
       pbegin++
       zeroes++
     }
-
-    // Allocate enough space in big-endian base58 representation.
-    const size = ((pend - pbegin) * iFACTOR + 1) >>> 0
-    const b58 = new Uint8Array(size)
-
-    // Process the bytes.
+        // Allocate enough space in big-endian base58 representation.
+    var size = ((pend - pbegin) * iFACTOR + 1) >>> 0
+    var b58 = new Uint8Array(size)
+        // Process the bytes.
     while (pbegin !== pend) {
-      let carry = source[pbegin]
-
-      // Apply "b58 = b58 * 256 + ch".
-      let i = 0
-      for (let it = size - 1; (carry !== 0 || i < length) && (it !== -1); it--, i++) {
-        carry += (256 * b58[it]) >>> 0
-        b58[it] = (carry % BASE) >>> 0
+      var carry = source[pbegin]
+            // Apply "b58 = b58 * 256 + ch".
+      var i = 0
+      for (var it1 = size - 1; (carry !== 0 || i < length) && (it1 !== -1); it1--, i++) {
+        carry += (256 * b58[it1]) >>> 0
+        b58[it1] = (carry % BASE) >>> 0
         carry = (carry / BASE) >>> 0
       }
-
-      if (carry !== 0) throw new Error('Non-zero carry')
+      if (carry !== 0) { throw new Error('Non-zero carry') }
       length = i
       pbegin++
     }
-
-    // Skip leading zeroes in base58 result.
-    let it = size - length
-    while (it !== size && b58[it] === 0) {
-      it++
+        // Skip leading zeroes in base58 result.
+    var it2 = size - length
+    while (it2 !== size && b58[it2] === 0) {
+      it2++
     }
-
-    // Translate the result into a string.
-    let str = LEADER.repeat(zeroes)
-    for (; it < size; ++it) str += ALPHABET.charAt(b58[it])
-
+        // Translate the result into a string.
+    var str = LEADER.repeat(zeroes)
+    for (; it2 < size; ++it2) { str += ALPHABET.charAt(b58[it2]) }
     return str
   }
-
   function decodeUnsafe (source) {
-    if (typeof source !== 'string') throw new TypeError('Expected String')
-    if (source.length === 0) return Buffer.alloc(0)
-
-    let psz = 0
-
-    // Skip leading spaces.
-    if (source[psz] === ' ') return
-
-    // Skip and count leading '1's.
-    let zeroes = 0
-    let length = 0
+    if (typeof source !== 'string') { throw new TypeError('Expected String') }
+    if (source.length === 0) { return _Buffer.alloc(0) }
+    var psz = 0
+        // Skip leading spaces.
+    if (source[psz] === ' ') { return }
+        // Skip and count leading '1's.
+    var zeroes = 0
+    var length = 0
     while (source[psz] === LEADER) {
       zeroes++
       psz++
     }
-
-    // Allocate enough space in big-endian base256 representation.
-    const size = (((source.length - psz) * FACTOR) + 1) >>> 0 // log(58) / log(256), rounded up.
-    const b256 = new Uint8Array(size)
-
-    // Process the characters.
+        // Allocate enough space in big-endian base256 representation.
+    var size = (((source.length - psz) * FACTOR) + 1) >>> 0 // log(58) / log(256), rounded up.
+    var b256 = new Uint8Array(size)
+        // Process the characters.
     while (source[psz]) {
-      // Decode character
-      let carry = BASE_MAP[source.charCodeAt(psz)]
-
-      // Invalid character
-      if (carry === 255) return
-
-      let i = 0
-      for (let it = size - 1; (carry !== 0 || i < length) && (it !== -1); it--, i++) {
-        carry += (BASE * b256[it]) >>> 0
-        b256[it] = (carry % 256) >>> 0
+            // Decode character
+      var carry = BASE_MAP[source.charCodeAt(psz)]
+            // Invalid character
+      if (carry === 255) { return }
+      var i = 0
+      for (var it3 = size - 1; (carry !== 0 || i < length) && (it3 !== -1); it3--, i++) {
+        carry += (BASE * b256[it3]) >>> 0
+        b256[it3] = (carry % 256) >>> 0
         carry = (carry / 256) >>> 0
       }
-
-      if (carry !== 0) throw new Error('Non-zero carry')
+      if (carry !== 0) { throw new Error('Non-zero carry') }
       length = i
       psz++
     }
-
-    // Skip trailing spaces.
-    if (source[psz] === ' ') return
-
-    // Skip leading zeroes in b256.
-    let it = size - length
-    while (it !== size && b256[it] === 0) {
-      it++
+        // Skip trailing spaces.
+    if (source[psz] === ' ') { return }
+        // Skip leading zeroes in b256.
+    var it4 = size - length
+    while (it4 !== size && b256[it4] === 0) {
+      it4++
     }
-
-    const vch = Buffer.allocUnsafe(zeroes + (size - it))
+    var vch = _Buffer.allocUnsafe(zeroes + (size - it4))
     vch.fill(0x00, 0, zeroes)
-
-    let j = zeroes
-    while (it !== size) {
-      vch[j++] = b256[it++]
+    var j = zeroes
+    while (it4 !== size) {
+      vch[j++] = b256[it4++]
     }
-
     return vch
   }
-
   function decode (string) {
-    const buffer = decodeUnsafe(string)
-    if (buffer) return buffer
-
+    var buffer = decodeUnsafe(string)
+    if (buffer) { return buffer }
     throw new Error('Non-base' + BASE + ' character')
   }
-
   return {
     encode: encode,
     decodeUnsafe: decodeUnsafe,
     decode: decode
   }
 }
+module.exports = base
 
-},{"safe-buffer":56}],26:[function(require,module,exports){
+},{"safe-buffer":57}],27:[function(require,module,exports){
 'use strict'
 
 exports.byteLength = byteLength
@@ -1713,7 +1835,8 @@ function toByteArray (b64) {
     ? validLen - 4
     : validLen
 
-  for (var i = 0; i < len; i += 4) {
+  var i
+  for (i = 0; i < len; i += 4) {
     tmp =
       (revLookup[b64.charCodeAt(i)] << 18) |
       (revLookup[b64.charCodeAt(i + 1)] << 12) |
@@ -1798,7 +1921,7 @@ function fromByteArray (uint8) {
   return parts.join('')
 }
 
-},{}],27:[function(require,module,exports){
+},{}],28:[function(require,module,exports){
 (function (module, exports) {
   'use strict';
 
@@ -5227,17 +5350,17 @@ function fromByteArray (uint8) {
   };
 })(typeof module === 'undefined' || module, this);
 
-},{"buffer":28}],28:[function(require,module,exports){
+},{"buffer":29}],29:[function(require,module,exports){
 
-},{}],29:[function(require,module,exports){
-arguments[4][28][0].apply(exports,arguments)
-},{"dup":28}],30:[function(require,module,exports){
+},{}],30:[function(require,module,exports){
+arguments[4][29][0].apply(exports,arguments)
+},{"dup":29}],31:[function(require,module,exports){
 var basex = require('base-x')
 var ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
 
 module.exports = basex(ALPHABET)
 
-},{"base-x":25}],31:[function(require,module,exports){
+},{"base-x":26}],32:[function(require,module,exports){
 (function (Buffer){
 /*!
  * The buffer module from node.js, for the browser.
@@ -5251,6 +5374,10 @@ module.exports = basex(ALPHABET)
 
 var base64 = require('base64-js')
 var ieee754 = require('ieee754')
+var customInspectSymbol =
+  (typeof Symbol === 'function' && typeof Symbol.for === 'function')
+    ? Symbol.for('nodejs.util.inspect.custom')
+    : null
 
 exports.Buffer = Buffer
 exports.SlowBuffer = SlowBuffer
@@ -5287,7 +5414,9 @@ function typedArraySupport () {
   // Can typed array instances can be augmented?
   try {
     var arr = new Uint8Array(1)
-    arr.__proto__ = { __proto__: Uint8Array.prototype, foo: function () { return 42 } }
+    var proto = { foo: function () { return 42 } }
+    Object.setPrototypeOf(proto, Uint8Array.prototype)
+    Object.setPrototypeOf(arr, proto)
     return arr.foo() === 42
   } catch (e) {
     return false
@@ -5316,7 +5445,7 @@ function createBuffer (length) {
   }
   // Return an augmented `Uint8Array` instance
   var buf = new Uint8Array(length)
-  buf.__proto__ = Buffer.prototype
+  Object.setPrototypeOf(buf, Buffer.prototype)
   return buf
 }
 
@@ -5366,7 +5495,7 @@ function from (value, encodingOrOffset, length) {
   }
 
   if (value == null) {
-    throw TypeError(
+    throw new TypeError(
       'The first argument must be one of type string, Buffer, ArrayBuffer, Array, ' +
       'or Array-like Object. Received type ' + (typeof value)
     )
@@ -5418,8 +5547,8 @@ Buffer.from = function (value, encodingOrOffset, length) {
 
 // Note: Change prototype *after* Buffer.from is defined to workaround Chrome bug:
 // https://github.com/feross/buffer/pull/148
-Buffer.prototype.__proto__ = Uint8Array.prototype
-Buffer.__proto__ = Uint8Array
+Object.setPrototypeOf(Buffer.prototype, Uint8Array.prototype)
+Object.setPrototypeOf(Buffer, Uint8Array)
 
 function assertSize (size) {
   if (typeof size !== 'number') {
@@ -5523,7 +5652,8 @@ function fromArrayBuffer (array, byteOffset, length) {
   }
 
   // Return an augmented `Uint8Array` instance
-  buf.__proto__ = Buffer.prototype
+  Object.setPrototypeOf(buf, Buffer.prototype)
+
   return buf
 }
 
@@ -5845,6 +5975,9 @@ Buffer.prototype.inspect = function inspect () {
   if (this.length > max) str += ' ... '
   return '<Buffer ' + str + '>'
 }
+if (customInspectSymbol) {
+  Buffer.prototype[customInspectSymbol] = Buffer.prototype.inspect
+}
 
 Buffer.prototype.compare = function compare (target, start, end, thisStart, thisEnd) {
   if (isInstance(target, Uint8Array)) {
@@ -5970,7 +6103,7 @@ function bidirectionalIndexOf (buffer, val, byteOffset, encoding, dir) {
         return Uint8Array.prototype.lastIndexOf.call(buffer, val, byteOffset)
       }
     }
-    return arrayIndexOf(buffer, [ val ], byteOffset, encoding, dir)
+    return arrayIndexOf(buffer, [val], byteOffset, encoding, dir)
   }
 
   throw new TypeError('val must be string, number or Buffer')
@@ -6299,7 +6432,7 @@ function hexSlice (buf, start, end) {
 
   var out = ''
   for (var i = start; i < end; ++i) {
-    out += toHex(buf[i])
+    out += hexSliceLookupTable[buf[i]]
   }
   return out
 }
@@ -6336,7 +6469,8 @@ Buffer.prototype.slice = function slice (start, end) {
 
   var newBuf = this.subarray(start, end)
   // Return an augmented `Uint8Array` instance
-  newBuf.__proto__ = Buffer.prototype
+  Object.setPrototypeOf(newBuf, Buffer.prototype)
+
   return newBuf
 }
 
@@ -6825,6 +6959,8 @@ Buffer.prototype.fill = function fill (val, start, end, encoding) {
     }
   } else if (typeof val === 'number') {
     val = val & 255
+  } else if (typeof val === 'boolean') {
+    val = Number(val)
   }
 
   // Invalid ranges are not set to a default, so can range check early.
@@ -6880,11 +7016,6 @@ function base64clean (str) {
     str = str + '='
   }
   return str
-}
-
-function toHex (n) {
-  if (n < 16) return '0' + n.toString(16)
-  return n.toString(16)
 }
 
 function utf8ToBytes (string, units) {
@@ -7017,14 +7148,28 @@ function numberIsNaN (obj) {
   return obj !== obj // eslint-disable-line no-self-compare
 }
 
+// Create lookup table for `toString('hex')`
+// See: https://github.com/feross/buffer/issues/219
+var hexSliceLookupTable = (function () {
+  var alphabet = '0123456789abcdef'
+  var table = new Array(256)
+  for (var i = 0; i < 16; ++i) {
+    var i16 = i * 16
+    for (var j = 0; j < 16; ++j) {
+      table[i16 + j] = alphabet[i] + alphabet[j]
+    }
+  }
+  return table
+})()
+
 }).call(this,require("buffer").Buffer)
-},{"base64-js":26,"buffer":31,"ieee754":48}],32:[function(require,module,exports){
+},{"base64-js":27,"buffer":32,"ieee754":49}],33:[function(require,module,exports){
 require(".").check("es5");
-},{".":33}],33:[function(require,module,exports){
+},{".":34}],34:[function(require,module,exports){
 require("./lib/definitions");
 module.exports = require("./lib");
 
-},{"./lib":36,"./lib/definitions":35}],34:[function(require,module,exports){
+},{"./lib":37,"./lib/definitions":36}],35:[function(require,module,exports){
 var CapabilityDetector = function () {
     this.tests = {};
     this.cache = {};
@@ -7054,7 +7199,7 @@ CapabilityDetector.prototype = {
 };
 
 module.exports = CapabilityDetector;
-},{}],35:[function(require,module,exports){
+},{}],36:[function(require,module,exports){
 var capability = require("."),
     define = capability.define,
     test = capability.test;
@@ -7123,7 +7268,7 @@ define("Error.prototype.stack", function () {
         return e.stack || e.stacktrace;
     }
 });
-},{".":36}],36:[function(require,module,exports){
+},{".":37}],37:[function(require,module,exports){
 var CapabilityDetector = require("./CapabilityDetector");
 
 var detector = new CapabilityDetector();
@@ -7140,7 +7285,7 @@ capability.check = function (name) {
 capability.test = capability;
 
 module.exports = capability;
-},{"./CapabilityDetector":34}],37:[function(require,module,exports){
+},{"./CapabilityDetector":35}],38:[function(require,module,exports){
 /*!
  * depd
  * Copyright(c) 2015 Douglas Christopher Wilson
@@ -7219,9 +7364,9 @@ function wrapproperty (obj, prop, message) {
   }
 }
 
-},{}],38:[function(require,module,exports){
+},{}],39:[function(require,module,exports){
 module.exports = require("./lib");
-},{"./lib":39}],39:[function(require,module,exports){
+},{"./lib":40}],40:[function(require,module,exports){
 require("capability/es5");
 
 var capability = require("capability");
@@ -7235,7 +7380,7 @@ else
     polyfill = require("./unsupported");
 
 module.exports = polyfill();
-},{"./non-v8/index":43,"./unsupported":45,"./v8":46,"capability":33,"capability/es5":32}],40:[function(require,module,exports){
+},{"./non-v8/index":44,"./unsupported":46,"./v8":47,"capability":34,"capability/es5":33}],41:[function(require,module,exports){
 var Class = require("o3").Class,
     abstractMethod = require("o3").abstractMethod;
 
@@ -7266,7 +7411,7 @@ var Frame = Class(Object, {
 });
 
 module.exports = Frame;
-},{"o3":51}],41:[function(require,module,exports){
+},{"o3":52}],42:[function(require,module,exports){
 var Class = require("o3").Class,
     Frame = require("./Frame"),
     cache = require("u3").cache;
@@ -7305,7 +7450,7 @@ module.exports = {
         return instance;
     })
 };
-},{"./Frame":40,"o3":51,"u3":62}],42:[function(require,module,exports){
+},{"./Frame":41,"o3":52,"u3":63}],43:[function(require,module,exports){
 var Class = require("o3").Class,
     abstractMethod = require("o3").abstractMethod,
     eachCombination = require("u3").eachCombination,
@@ -7439,7 +7584,7 @@ module.exports = {
         return instance;
     })
 };
-},{"capability":33,"o3":51,"u3":62}],43:[function(require,module,exports){
+},{"capability":34,"o3":52,"u3":63}],44:[function(require,module,exports){
 var FrameStringSource = require("./FrameStringSource"),
     FrameStringParser = require("./FrameStringParser"),
     cache = require("u3").cache,
@@ -7513,7 +7658,7 @@ module.exports = function () {
         prepareStackTrace: prepareStackTrace
     };
 };
-},{"../prepareStackTrace":44,"./FrameStringParser":41,"./FrameStringSource":42,"u3":62}],44:[function(require,module,exports){
+},{"../prepareStackTrace":45,"./FrameStringParser":42,"./FrameStringSource":43,"u3":63}],45:[function(require,module,exports){
 var prepareStackTrace = function (throwable, frames, warnings) {
     var string = "";
     string += throwable.name || "Error";
@@ -7531,7 +7676,7 @@ var prepareStackTrace = function (throwable, frames, warnings) {
 };
 
 module.exports = prepareStackTrace;
-},{}],45:[function(require,module,exports){
+},{}],46:[function(require,module,exports){
 var cache = require("u3").cache,
     prepareStackTrace = require("./prepareStackTrace");
 
@@ -7582,7 +7727,7 @@ module.exports = function () {
         prepareStackTrace: prepareStackTrace
     };
 };
-},{"./prepareStackTrace":44,"u3":62}],46:[function(require,module,exports){
+},{"./prepareStackTrace":45,"u3":63}],47:[function(require,module,exports){
 var prepareStackTrace = require("./prepareStackTrace");
 
 module.exports = function () {
@@ -7594,7 +7739,7 @@ module.exports = function () {
         prepareStackTrace: prepareStackTrace
     };
 };
-},{"./prepareStackTrace":44}],47:[function(require,module,exports){
+},{"./prepareStackTrace":45}],48:[function(require,module,exports){
 /*!
  * http-errors
  * Copyright(c) 2014 Jonathan Ong
@@ -7862,7 +8007,7 @@ function populateConstructorExports (exports, codes, HttpError) {
     '"I\'mateapot"; use "ImATeapot" instead')
 }
 
-},{"depd":37,"inherits":49,"setprototypeof":57,"statuses":59,"toidentifier":60}],48:[function(require,module,exports){
+},{"depd":38,"inherits":50,"setprototypeof":58,"statuses":60,"toidentifier":61}],49:[function(require,module,exports){
 exports.read = function (buffer, offset, isLE, mLen, nBytes) {
   var e, m
   var eLen = (nBytes * 8) - mLen - 1
@@ -7948,32 +8093,36 @@ exports.write = function (buffer, value, offset, isLE, mLen, nBytes) {
   buffer[offset + i - d] |= s * 128
 }
 
-},{}],49:[function(require,module,exports){
+},{}],50:[function(require,module,exports){
 if (typeof Object.create === 'function') {
   // implementation from standard node.js 'util' module
   module.exports = function inherits(ctor, superCtor) {
-    ctor.super_ = superCtor
-    ctor.prototype = Object.create(superCtor.prototype, {
-      constructor: {
-        value: ctor,
-        enumerable: false,
-        writable: true,
-        configurable: true
-      }
-    });
+    if (superCtor) {
+      ctor.super_ = superCtor
+      ctor.prototype = Object.create(superCtor.prototype, {
+        constructor: {
+          value: ctor,
+          enumerable: false,
+          writable: true,
+          configurable: true
+        }
+      })
+    }
   };
 } else {
   // old school shim for old browsers
   module.exports = function inherits(ctor, superCtor) {
-    ctor.super_ = superCtor
-    var TempCtor = function () {}
-    TempCtor.prototype = superCtor.prototype
-    ctor.prototype = new TempCtor()
-    ctor.prototype.constructor = ctor
+    if (superCtor) {
+      ctor.super_ = superCtor
+      var TempCtor = function () {}
+      TempCtor.prototype = superCtor.prototype
+      ctor.prototype = new TempCtor()
+      ctor.prototype.constructor = ctor
+    }
   }
 }
 
-},{}],50:[function(require,module,exports){
+},{}],51:[function(require,module,exports){
 (function (process,global){
 /**
  * [js-sha256]{@link https://github.com/emn178/js-sha256}
@@ -8495,11 +8644,11 @@ if (typeof Object.create === 'function') {
 })();
 
 }).call(this,require('_process'),typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"_process":55}],51:[function(require,module,exports){
+},{"_process":56}],52:[function(require,module,exports){
 require("capability/es5");
 
 module.exports = require("./lib");
-},{"./lib":54,"capability/es5":32}],52:[function(require,module,exports){
+},{"./lib":55,"capability/es5":33}],53:[function(require,module,exports){
 var Class = function () {
     var options = Object.create({
         Source: Object,
@@ -8634,16 +8783,16 @@ Class.newInstance = function () {
 };
 
 module.exports = Class;
-},{}],53:[function(require,module,exports){
+},{}],54:[function(require,module,exports){
 module.exports = function () {
     throw new Error("Not implemented.");
 };
-},{}],54:[function(require,module,exports){
+},{}],55:[function(require,module,exports){
 module.exports = {
     Class: require("./Class"),
     abstractMethod: require("./abstractMethod")
 };
-},{"./Class":52,"./abstractMethod":53}],55:[function(require,module,exports){
+},{"./Class":53,"./abstractMethod":54}],56:[function(require,module,exports){
 // shim for using process in browser
 var process = module.exports = {};
 
@@ -8829,7 +8978,7 @@ process.chdir = function (dir) {
 };
 process.umask = function() { return 0; };
 
-},{}],56:[function(require,module,exports){
+},{}],57:[function(require,module,exports){
 /* eslint-disable node/no-deprecated-api */
 var buffer = require('buffer')
 var Buffer = buffer.Buffer
@@ -8851,6 +9000,8 @@ if (Buffer.from && Buffer.alloc && Buffer.allocUnsafe && Buffer.allocUnsafeSlow)
 function SafeBuffer (arg, encodingOrOffset, length) {
   return Buffer(arg, encodingOrOffset, length)
 }
+
+SafeBuffer.prototype = Object.create(Buffer.prototype)
 
 // Copy static methods from Buffer
 copyProps(Buffer, SafeBuffer)
@@ -8893,7 +9044,7 @@ SafeBuffer.allocUnsafeSlow = function (size) {
   return buffer.SlowBuffer(size)
 }
 
-},{"buffer":31}],57:[function(require,module,exports){
+},{"buffer":32}],58:[function(require,module,exports){
 'use strict'
 /* eslint no-proto: 0 */
 module.exports = Object.setPrototypeOf || ({ __proto__: [] } instanceof Array ? setProtoOf : mixinProperties)
@@ -8912,7 +9063,7 @@ function mixinProperties (obj, proto) {
   return obj
 }
 
-},{}],58:[function(require,module,exports){
+},{}],59:[function(require,module,exports){
 module.exports={
   "100": "Continue",
   "101": "Switching Protocols",
@@ -8980,7 +9131,7 @@ module.exports={
   "511": "Network Authentication Required"
 }
 
-},{}],59:[function(require,module,exports){
+},{}],60:[function(require,module,exports){
 /*!
  * statuses
  * Copyright(c) 2014 Jonathan Ong
@@ -9095,7 +9246,7 @@ function status (code) {
   return n
 }
 
-},{"./codes.json":58}],60:[function(require,module,exports){
+},{"./codes.json":59}],61:[function(require,module,exports){
 /*!
  * toidentifier
  * Copyright(c) 2016 Douglas Christopher Wilson
@@ -9127,7 +9278,7 @@ function toIdentifier (str) {
     .replace(/[^ _0-9a-z]/gi, '')
 }
 
-},{}],61:[function(require,module,exports){
+},{}],62:[function(require,module,exports){
 (function(nacl) {
 'use strict';
 
@@ -11506,9 +11657,9 @@ nacl.setPRNG = function(fn) {
 
 })(typeof module !== 'undefined' && module.exports ? module.exports : (self.nacl = self.nacl || {}));
 
-},{"crypto":28}],62:[function(require,module,exports){
-arguments[4][38][0].apply(exports,arguments)
-},{"./lib":65,"dup":38}],63:[function(require,module,exports){
+},{"crypto":29}],63:[function(require,module,exports){
+arguments[4][39][0].apply(exports,arguments)
+},{"./lib":66,"dup":39}],64:[function(require,module,exports){
 var cache = function (fn) {
     var called = false,
         store;
@@ -11530,7 +11681,7 @@ var cache = function (fn) {
 };
 
 module.exports = cache;
-},{}],64:[function(require,module,exports){
+},{}],65:[function(require,module,exports){
 module.exports = function eachCombination(alternativesByDimension, callback, combination) {
     if (!combination)
         combination = [];
@@ -11545,19 +11696,44 @@ module.exports = function eachCombination(alternativesByDimension, callback, com
     else
         callback.apply(null, combination);
 };
-},{}],65:[function(require,module,exports){
+},{}],66:[function(require,module,exports){
 module.exports = {
     cache: require("./cache"),
     eachCombination: require("./eachCombination")
 };
-},{"./cache":63,"./eachCombination":64}],66:[function(require,module,exports){
+},{"./cache":64,"./eachCombination":65}],67:[function(require,module,exports){
+if (typeof Object.create === 'function') {
+  // implementation from standard node.js 'util' module
+  module.exports = function inherits(ctor, superCtor) {
+    ctor.super_ = superCtor
+    ctor.prototype = Object.create(superCtor.prototype, {
+      constructor: {
+        value: ctor,
+        enumerable: false,
+        writable: true,
+        configurable: true
+      }
+    });
+  };
+} else {
+  // old school shim for old browsers
+  module.exports = function inherits(ctor, superCtor) {
+    ctor.super_ = superCtor
+    var TempCtor = function () {}
+    TempCtor.prototype = superCtor.prototype
+    ctor.prototype = new TempCtor()
+    ctor.prototype.constructor = ctor
+  }
+}
+
+},{}],68:[function(require,module,exports){
 module.exports = function isBuffer(arg) {
   return arg && typeof arg === 'object'
     && typeof arg.copy === 'function'
     && typeof arg.fill === 'function'
     && typeof arg.readUInt8 === 'function';
 }
-},{}],67:[function(require,module,exports){
+},{}],69:[function(require,module,exports){
 (function (process,global){
 // Copyright Joyent, Inc. and other Node contributors.
 //
@@ -12147,4 +12323,4 @@ function hasOwnProperty(obj, prop) {
 }
 
 }).call(this,require('_process'),typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"./support/isBuffer":66,"_process":55,"inherits":49}]},{},[1]);
+},{"./support/isBuffer":68,"_process":56,"inherits":67}]},{},[1]);

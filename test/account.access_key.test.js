@@ -69,10 +69,13 @@ test('view account details after adding access keys', async() => {
 
 test('loading account after adding a full key', async() => {
     const keyPair = nearlib.utils.KeyPair.fromRandom('ed25519');
-    await workingAccount.addKey(keyPair.getPublicKey());
+    // wallet calls this with an empty string for contract id and method
+    await workingAccount.addKey(keyPair.getPublicKey(), '', '');
 
     let accessKeys = await workingAccount.getAccessKeys();
 
     expect(accessKeys.length).toBe(2);
-    expect(accessKeys.map((item) => item.public_key).includes(keyPair.getPublicKey().toString())).toBe(true);
+    const addedKey = accessKeys.find(item => item.public_key == keyPair.getPublicKey().toString());
+    expect(addedKey).toBeTruthy();
+    expect(addedKey.access_key.permission).toEqual('FullAccess');
 });

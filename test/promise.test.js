@@ -41,7 +41,7 @@ describe('with promises', () => {
     // => means callback
 
     test('single promise, no callback (A->B)', async () => {
-        await contract.callPromise({args: {
+        const realResult = await contract.callPromise({args: {
             receiver: contractName1,
             methodName: 'callbackWithName',
             args: null,
@@ -57,10 +57,11 @@ describe('with promises', () => {
             rs: [],
             n: contractName1,
         });
+        expect(realResult).toEqual(lastResult);
     });
 
     test('single promise with callback (A->B=>A)', async () => {
-        await contract.callPromise({args: {
+        const realResult = await contract.callPromise({args: {
             receiver: contractName1,
             methodName: 'callbackWithName',
             args: null,
@@ -84,53 +85,55 @@ describe('with promises', () => {
             }],
             n: contractName,
         });
+        expect(realResult).toEqual(lastResult);
     });
 
     test('two promises, no callbacks (A->B->C)', async () => {
-        await contract.callPromise({args: {
+        const realResult = await contract.callPromise({args: {
             receiver: contractName1,
             methodName: 'callPromise',
             args: {
                 receiver: contractName2,
                 methodName: 'callbackWithName',
                 args: null,
-                gas: 100000,
+                gas: 400000,
                 balance: 0,
                 callback: null,
                 callbackArgs: null,
                 callbackBalance: 0,
-                callbackGas: 100000,
+                callbackGas: 200000,
             },
-            gas: 300000,
+            gas: 600000,
             balance: 0,
             callback: null,
             callbackArgs: null,
             callbackBalance: 0,
-            callbackGas: 300000,
+            callbackGas: 600000,
         }});
         const lastResult2 = await contract2.getLastResult();
         expect(lastResult2).toEqual({
             rs: [],
             n: contractName2,
         });
+        expect(realResult).toEqual(lastResult2);
     });
 
     test('two promises, with two callbacks (A->B->C=>B=>A)', async () => {
-        await contract.callPromise({args: {
+        const realResult = await contract.callPromise({args: {
             receiver: contractName1,
             methodName: 'callPromise',
             args: {
                 receiver: contractName2,
                 methodName: 'callbackWithName',
                 args: null,
-                gas: 200000,
+                gas: 400000,
                 balance: 0,
                 callback: 'callbackWithName',
                 callbackArgs: null,
                 callbackBalance: 0,
                 callbackGas: 200000,
             },
-            gas: 500000,
+            gas: 1000000,
             balance: 0,
             callback: 'callbackWithName',
             callbackArgs: null,
@@ -158,24 +161,25 @@ describe('with promises', () => {
             }],
             n: contractName,
         });
+        expect(realResult).toEqual(lastResult);
     });
 
     test('cross contract call with callbacks (A->B->A=>B=>A)', async () => {
-        await contract.callPromise({args: {
+        const realResult = await contract.callPromise({args: {
             receiver: contractName1,
             methodName: 'callPromise',
             args: {
                 receiver: contractName,
                 methodName: 'callbackWithName',
                 args: null,
-                gas: 200000,
+                gas: 400000,
                 balance: 0,
                 callback: 'callbackWithName',
                 callbackArgs: null,
                 callbackBalance: 0,
-                callbackGas: 200000,
+                callbackGas: 400000,
             },
-            gas: 500000,
+            gas: 1000000,
             balance: 0,
             callback: 'callbackWithName',
             callbackArgs: null,
@@ -201,10 +205,11 @@ describe('with promises', () => {
             }],
             n: contractName,
         });
+        expect(realResult).toEqual(lastResult);
     });
 
     test('2 promises with 1 skipped callbacks (A->B->C=>A)', async () => {
-        await contract.callPromise({args: {
+        const realResult = await contract.callPromise({args: {
             receiver: contractName1,
             methodName: 'callPromise',
             args: {
@@ -238,5 +243,45 @@ describe('with promises', () => {
             }],
             n: contractName,
         });
+        expect(realResult).toEqual(lastResult);
     });
+
+    test('two promises, with one callbacks to B only (A->B->C=>B)', async () => {
+        const realResult = await contract.callPromise({args: {
+            receiver: contractName1,
+            methodName: 'callPromise',
+            args: {
+                receiver: contractName2,
+                methodName: 'callbackWithName',
+                args: null,
+                gas: 400000,
+                balance: 0,
+                callback: 'callbackWithName',
+                callbackArgs: null,
+                callbackBalance: 0,
+                callbackGas: 400000,
+            },
+            gas: 1000000,
+            balance: 0,
+            callback: null,
+            callbackArgs: null,
+            callbackBalance: 0,
+            callbackGas: 0,
+        }});
+        const lastResult2 = await contract2.getLastResult();
+        expect(lastResult2).toEqual({
+            rs: [],
+            n: contractName2,
+        });
+        const lastResult1 = await contract1.getLastResult();
+        expect(lastResult1).toEqual({
+            rs: [{
+                ok: true,
+                r: lastResult2,
+            }],
+            n: contractName1,
+        });
+        expect(realResult).toEqual(lastResult1);
+    });
+
 });
