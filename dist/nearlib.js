@@ -1616,9 +1616,12 @@ async function fetchJson(connection, json) {
 exports.fetchJson = fetchJson;
 
 },{"http":30,"http-errors":48,"https":30,"node-fetch":30}],25:[function(require,module,exports){
+(function (Buffer){
 'use strict';
 Object.defineProperty(exports, "__esModule", { value: true });
 const utils_1 = require("./utils");
+const transaction_1 = require("./transaction");
+const utils_2 = require("./utils");
 const LOGIN_WALLET_URL_SUFFIX = '/login/';
 const LOCAL_STORAGE_KEY_SUFFIX = '_wallet_auth_key';
 const PENDING_ACCESS_KEY_PREFIX = 'pending_key'; // browser storage key for a pending access key (i.e. key has been generated but we are not sure it was added yet)
@@ -1679,6 +1682,20 @@ class WalletAccount {
         await this._keyStore.setKey(this._networkId, PENDING_ACCESS_KEY_PREFIX + accessKey.getPublicKey(), accessKey);
         window.location.assign(newUrl.toString());
     }
+    async requestSignTransactions(transactions, callbackUrl, options) {
+        const currentUrl = new URL(window.location.href);
+        const newUrl = new URL('sign', this._walletBaseUrl);
+        newUrl.searchParams.set('accountId', options.accountId);
+        newUrl.searchParams.set('callbackUrl', callbackUrl || currentUrl.href);
+        newUrl.searchParams.set('transactions', transactions
+            .map(transaction => utils_2.serialize.serialize(transaction_1.SCHEMA, transaction))
+            .map(serialized => Buffer.from(serialized).toString('base64'))
+            .join(','));
+        newUrl.searchParams.set('accountId', options.accountId);
+        newUrl.searchParams.set('publicKey', options.publicKey);
+        newUrl.searchParams.set('send', (!!options.send).toString());
+        window.location.assign(newUrl.toString());
+    }
     /**
      * Complete sign in for a given account id and public key. To be invoked by the app when getting a callback from the wallet.
      */
@@ -1714,7 +1731,8 @@ class WalletAccount {
 }
 exports.WalletAccount = WalletAccount;
 
-},{"./utils":20}],26:[function(require,module,exports){
+}).call(this,require("buffer").Buffer)
+},{"./transaction":18,"./utils":20,"buffer":32}],26:[function(require,module,exports){
 'use strict'
 // base-x encoding / decoding
 // Copyright (c) 2018 base-x contributors
