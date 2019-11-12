@@ -55,7 +55,7 @@ export class PublicKey {
         } else if (parts.length === 2) {
             return new PublicKey(str_to_key_type(parts[0]), base_decode(parts[1]));
         } else {
-            throw new Error('Invlaid encoded key format, must be <curve>:<encoded key>');
+            throw new Error('Invalid encoded key format, must be <curve>:<encoded key>');
         }
     }
 
